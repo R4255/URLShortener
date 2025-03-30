@@ -1,0 +1,12 @@
+#Defines data sources that Grafana connects to.
+#Common data sources:
+#Prometheus (for scraping metrics).
+#PostgreSQL, MySQL, InfluxDB, Elasticsearch (for databases).
+
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy  #proxy: Grafana will act as a proxy and fetch data directly from Prometheus.
+    url: http://prometheus:9090
+    isDefault: true

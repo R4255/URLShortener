@@ -1,0 +1,17 @@
+#This YAML file automates dashboard loading.
+#It tells Grafana where to find dashboards (e.g., dashboards/url_shortener_dashboard.json).
+#Instead of manually uploading dashboards, Grafana reads this file and auto-imports dashboards.
+
+apiVersion: 1
+providers:
+  - name: 'URL Shortener'
+    orgId: 1
+    folder: '' #The folder in which dashboards will be placed inside Grafana.
+    type: file
+    disableDeletion: false
+    #disableDeletion: false → Users can delete provisioned dashboards from the Grafana UI.
+    updateIntervalSeconds: 10
+    #updateIntervalSeconds: 10 → Grafana will check for changes in the dashboard JSON files every 10 seconds.
+    options:
+      path: /etc/grafana/dashboards #The directory where Grafana will look for dashboard JSON files.
+    

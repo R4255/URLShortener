@@ -1,0 +1,114 @@
+#Simplifies running and managing multiple containers with a single command.
+version: '3.8' #Specifies the version of the Docker Compose file format
+services:
+  #Postgresql DB
+  db:
+    image: postgres:14-alpine
+    container_name: urlshortener_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      #Mounts a volume (postgres_data) to persist database data across container restarts.
+      #Maps to /var/lib/postgresql/data inside the container (PostgreSQL's default data directory).
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=urlshortener #POSTGRES_DB: Name of the database to creat
+    ports:
+      - "5432:5432" #Maps port 5432 on the host to port 5432 on the container.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  #Redis for caching 
+  redis:
+    image: redis:6-alpine
+    container_name: urlshortener-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  #Backend API
+  api:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: urlshortener-api
+    volumes:
+      - ./backend:/app
+      #Mounts the backend directory to /app inside the container for live code updates during development.
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=development #Sets the Flask environment to development For Debugging
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/urlshortener
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=True
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  
+  #Frontend React App
+  web:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: urlshortener-web
+    volumes:
+      - ./frontend:/app
+      #Mounts the frontend directory to /app inside the container for live code updates during development.
+      - /app/node_modules #Excludes the /app/node_modules directory to avoid conflicts.
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_BASE_URL=http://localhost:5000
+    depends_on:
+      - api
+  
+  prometheus:
+    image: prom/prometheus:v2.30.3
+    container_name: urlshortener-prometheus
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:8.2.0
+    container_name: urlshortener-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=password
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+  
+  #volumes: Defines named volumes to persist data across container restarts
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
