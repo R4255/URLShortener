@@ -1,0 +1,74 @@
+pipeline{
+    agent any // run on any available agent
+    environment{
+        APP_NAME = 'url_shortener'
+        DOCKER_COMPOSE_VERSION = '2.21.0'
+        DOCKER_CREDENTIALS = credentials('docker-hub-credentials')
+    }
+    //defining the pipeline stages
+    stages{
+        // Checkout the code from the repository
+        stage('Checkout'){
+            steps{
+                checkout scm
+                echo(message: 'Checking out the code from the repository')
+            }
+        }
+        // Build the Docker image
+        stage('Build'){
+            steps{
+                sh 'docker-compose build'
+                echo 'Built Docker images'
+            }
+        }
+        // Run the tests
+        stage('Test'){
+            steps{
+                sh'''
+                docker-compose run --rm api pytest tests/ -v
+                '''
+                echo(message: 'Test completed')
+            }
+        }
+        // Now we deploy
+        stage('Deploy'){
+            when{
+                branch 'main'
+            }
+            steps{
+                // Stop any existing containers (|| true ensures the build doesn't fail if none exist)
+                sh 'docker-compose down || true'
+                // Start the application in detached mode (runs in the background)
+                sh 'docker-compose up -d'
+                echo(message: 'Application Deployed Successfully')
+            }
+        }
+        
+        stage('Security Scan'){
+            steps{
+                echo(message: 'Running security scan')
+                // to be added in the future
+                echo 'Security scan completed'
+            }
+        }
+    }
+    
+    post{
+        always{
+            sh 'docker-compose logs > build-logs.txt'
+            //archive the logs as artifacts that can be downloaded from Jenkins
+            archiveArtifacts artifacts: 'build-logs.txt', fingerprint: true
+        }
+        success{
+            echo(message: 'Pipeline completed successfully')
+            // in future we can add notifications here
+            // for example, send a message to Slack or email
+
+        }
+        failure{
+            echo(message: 'URL Shortener pipeline failed')
+            sh 'docker-compose down || true'
+        }
+
+    }
+}
