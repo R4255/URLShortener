@@ -45,7 +45,7 @@ services:
       - ./backend:/app
       #Mounts the backend directory to /app inside the container for live code updates during development.
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
       - FLASK_APP=app.py
       - FLASK_ENV=development #Sets the Flask environment to development For Debugging
@@ -71,7 +71,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - REACT_APP_API_BASE_URL=http://localhost:5000
+      - REACT_APP_API_BASE_URL=http://localhost:5001
     depends_on:
       - api
   

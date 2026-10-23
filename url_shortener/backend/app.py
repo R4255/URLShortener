@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from sqlalchemy.sql import func
 import string
 import random
@@ -8,13 +9,17 @@ import os
 from datetime import datetime, timedelta  # Added timedelta import
 import hashlib
 import logging
-from dotenv import load_dotenv
 import uuid
-import logger
 from prometheus_flask_exporter import PrometheusMetrics
+import redis
+import json
+import threading
+import time
+from dotenv import load_dotenv
 
 load_dotenv()
 app = Flask(__name__)
+logger = app.logger
 metrics=PrometheusMetrics(app)
 
 CORS(app)
@@ -23,7 +28,17 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
     "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/urlshortener"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_size": 20,
+    "max_overflow": 10,
+    "pool_timeout": 30,
+    "pool_recycle": 1800,
+}
 db = SQLAlchemy(app)
+
+redis_client = redis.Redis.from_url(
+    os.getenv("REDIS_URL", "redis://localhost:6379/0")
+)
 
 
 # Now the Models
@@ -45,13 +60,43 @@ class URLAccess(db.Model):
     referrer = db.Column(db.String(2048), nullable=True)  # Changed to nullable=True
 
 
+# Base62 mapping character set: digits, lowercase, uppercase
+BASE62_CHARS = string.digits + string.ascii_lowercase + string.ascii_uppercase
+
+def encode_base62(num, length=6):
+    """Encodes an integer into a uniform-length Base62 string."""
+    arr = []
+    for _ in range(length):
+        num, rem = divmod(num, 62)
+        arr.append(BASE62_CHARS[rem])
+    arr.reverse()
+    return "".join(arr)
+
+def scramble_id(num):
+    """Applies a bijective 32-bit XOR to scramble the counter sequence without collisions."""
+    # We restrict to a 32-bit space (limit = 2^32 = 4,294,967,296)
+    # Since 2^32 is less than 62^6 (56.8 billion), the scrambled number is guaranteed 
+    # to yield a Base62 string of exactly 6 characters or less.
+    # Because we do not use the modulo operator here, the XOR is 100% collision-free (bijection).
+    mask = 0xFFFFFFFF
+    # An arbitrary 32-bit key to scramble the bits
+    key = 0x5DB37F9A
+    return (num & mask) ^ key
+
 # now the custom URL Generating Function
-def generate_short_code(length=6):
-    chars = string.ascii_letters + string.digits
-    while True:
-        short_code = "".join(random.choice(chars) for _ in range(length))
-        if not URL.query.filter_by(short_code=short_code).first():
-            return short_code
+def generate_short_code():
+    """Generates a unique, collision-free short code using a Redis atomic counter."""
+    try:
+        # Atomic increment from Redis
+        counter = redis_client.incr("url_id_counter")
+        # Scramble and encode
+        scrambled = scramble_id(counter)
+        return encode_base62(scrambled)
+    except Exception as e:
+        logger.error(f"Redis counter failed, falling back to random generator: {str(e)}")
+        # Fallback to random alphanumeric string if Redis is unreachable
+        chars = string.ascii_letters + string.digits
+        return "".join(random.choice(chars) for _ in range(6))
 
 
 # also we can use the hash based shortening
@@ -80,7 +125,7 @@ Hexadecimal Hash: 563d7f5b5e6a6b8f8e9c3d4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b
 @app.route("/health", methods=["GET"])
 def health_check():
     try:
-        db.session.execute("SELECT 1")
+        db.session.execute(text("SELECT 1"))
         return jsonify({"status": "healthy", "database": "connected"}), 200
     except Exception as e:
         logger.error(f"Health Check Failed: {str(e)}")
@@ -149,10 +194,40 @@ def shorten_url():
 # Now api to redirect to the original URL
 @app.route("/<short_code>", methods=["GET"])  # Changed to GET for proper redirects
 def redirect_to_url(short_code):
+    try:
+        # 1. Try checking Redis Cache first
+        cached_data = redis_client.get(f"url:{short_code}")
+        if cached_data:
+            data = json.loads(cached_data)
+            # Push access log to Redis queue to be processed asynchronously
+            access_event = {
+                "url_id": data["id"],
+                "ip_address": request.remote_addr,
+                "user_agent": request.headers.get("User-Agent", ""),
+                "referrer": request.headers.get("Referer", ""),
+                "accessed_at": datetime.utcnow().isoformat()
+            }
+            redis_client.rpush("url_access_logs", json.dumps(access_event))
+            return redirect(data["original_url"])
+    except Exception as e:
+        logger.error(f"Redis Cache Error: {str(e)}")
+
+    # 2. Cache Miss: Query PostgreSQL
     url_entry = URL.query.filter_by(short_code=short_code).first()
     if not url_entry:
         return jsonify({"error": "URL not Found"}), 404
-    # Record the access
+
+    # Cache the result in Redis for future reads
+    try:
+        redis_client.setex(
+            f"url:{short_code}",
+            3600,
+            json.dumps({"id": url_entry.id, "original_url": url_entry.original_url})
+        )
+    except Exception as e:
+        logger.error(f"Redis Cache Set Error: {str(e)}")
+
+    # Record the access synchronously for cache miss
     access_log = URLAccess(
         url_id=url_entry.id,
         ip_address=request.remote_addr,
@@ -281,14 +356,83 @@ def delete_url(short_code):
         return jsonify({"Error": "Failed to Delete the URL"}), 500
 
 
-# @app.before_first_request
-# def initialize_database():
-#     db.create_all()
+def batch_process_logs():
+    with app.app_context():
+        while True:
+            time.sleep(2)  # Process every 2 seconds
+            try:
+                # Fetch logs from Redis
+                logs = []
+                # Pop up to 1000 logs at a time
+                for _ in range(1000):
+                    log_data = redis_client.lpop("url_access_logs")
+                    if not log_data:
+                        break
+                    logs.append(json.loads(log_data))
+
+                if not logs:
+                    continue
+
+                # Group click counts to minimize DB writes
+                click_increments = {}
+                db_logs = []
+                for log in logs:
+                    url_id = log["url_id"]
+                    click_increments[url_id] = click_increments.get(url_id, 0) + 1
+
+                    db_logs.append(URLAccess(
+                        url_id=url_id,
+                        ip_address=log["ip_address"],
+                        user_agent=log["user_agent"],
+                        referrer=log["referrer"],
+                        accessed_at=datetime.fromisoformat(log["accessed_at"])
+                    ))
+
+                # Batch update click counts in Postgres
+                for url_id, count in click_increments.items():
+                    URL.query.filter_by(id=url_id).update({URL.clicks: URL.clicks + count})
+
+                # Batch insert access logs
+                db.session.bulk_save_objects(db_logs)
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"Error in batch logging background task: {str(e)}")
+
+# Lock to ensure the background thread is started only once per worker process
+_bg_thread_started = False
+_bg_thread_lock = threading.Lock()
+
+def start_background_workers():
+    global _bg_thread_started
+    with _bg_thread_lock:
+        if not _bg_thread_started:
+            try:
+                with app.app_context():
+                    db.create_all()
+            except Exception as e:
+                logger.error(f"Error creating tables during startup: {str(e)}")
+            
+            # Initialize Redis counter if it doesn't exist
+            try:
+                if not redis_client.exists("url_id_counter"):
+                    # Start at 10,000,000 to ensure codes are at least 5 characters long
+                    redis_client.set("url_id_counter", 10000000)
+                    logger.info("Initialized Redis counter 'url_id_counter' to 10,000,000")
+            except Exception as e:
+                logger.error(f"Failed to initialize Redis counter: {str(e)}")
+
+            # Start background thread
+            t = threading.Thread(target=batch_process_logs, daemon=True)
+            t.start()
+            _bg_thread_started = True
+            logger.info("Background click/access log flusher thread started.")
+
+# Start background workers on import
+start_background_workers()
 
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
